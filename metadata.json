@@ -1,0 +1,6 @@
+{
+  "name": "NOVA Studio AI",
+  "description": "Professional browser-based AI video editing platform with multi-track non-linear editing, cinematic transitions, color grading, and export pipeline.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
