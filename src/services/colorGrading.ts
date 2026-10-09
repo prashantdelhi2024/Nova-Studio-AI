@@ -1,6 +1,6 @@
 import { ColorGrade, FilterPreset } from '../types/editor';
 
-// Curated high-impact filter catalog with 30+ distinctive bases and procedural variations totaling 100+ presets
+// 32 Distinct, handcrafted functional color grading presets
 export const FILTER_PRESETS: FilterPreset[] = [
   // Cinematic
   {
@@ -8,7 +8,7 @@ export const FILTER_PRESETS: FilterPreset[] = [
     name: 'Teal & Orange Blockbuster',
     category: 'Cinematic',
     previewColor: '#008b8b',
-    colorGrade: { contrast: 25, saturation: 20, temperature: -15, tint: 10, highlights: 15, shadows: -20, vignette: 35 }
+    colorGrade: { contrast: 25, saturation: 20, temperature: -15, tint: 10, highlights: 15, shadows: -20, vignette: 35, grain: 10 }
   },
   {
     id: 'cinematic-hollywood-gold',
@@ -235,41 +235,17 @@ export const FILTER_PRESETS: FilterPreset[] = [
     category: 'Clean',
     previewColor: '#e11d48',
     colorGrade: { brightness: 8, contrast: 22, saturation: 25, highlights: 12, shadows: -10 }
+  },
+  {
+    id: 'clean-pastel-dream',
+    name: 'Pastel Dream Pop',
+    category: 'Clean',
+    previewColor: '#f472b6',
+    colorGrade: { brightness: 6, contrast: -8, saturation: 15, temperature: 8, tint: 12, highlights: 15, shadows: 20 }
   }
 ];
 
-// Generate an extended catalog of 100+ systematic variations across styles
-export const ALL_FILTER_PRESETS: FilterPreset[] = (() => {
-  const list = [...FILTER_PRESETS];
-  const tones = ['Soft', 'Intense', 'Minimal', 'Fade'];
-
-  FILTER_PRESETS.forEach((base) => {
-    tones.forEach((tone) => {
-      const mult = tone === 'Soft' ? 0.5 : tone === 'Intense' ? 1.4 : tone === 'Minimal' ? 0.25 : 0.8;
-      const g = base.colorGrade;
-      list.push({
-        id: `${base.id}-${tone.toLowerCase()}`,
-        name: `${base.name} (${tone})`,
-        category: base.category,
-        previewColor: base.previewColor,
-        colorGrade: {
-          brightness: Math.round((g.brightness || 0) * mult),
-          contrast: Math.round((g.contrast || 0) * mult),
-          saturation: g.saturation === -100 ? -100 : Math.round((g.saturation || 0) * mult),
-          temperature: Math.round((g.temperature || 0) * mult),
-          tint: Math.round((g.tint || 0) * mult),
-          exposure: Math.round((g.exposure || 0) * mult),
-          highlights: Math.round((g.highlights || 0) * mult),
-          shadows: Math.round((g.shadows || 0) * mult),
-          vignette: Math.round((g.vignette || 0) * (tone === 'Fade' ? 0.3 : mult)),
-          grain: tone === 'Intense' ? (g.grain ? g.grain + 15 : 15) : g.grain
-        }
-      });
-    });
-  });
-
-  return list;
-})();
+export const ALL_FILTER_PRESETS: FilterPreset[] = FILTER_PRESETS;
 
 export const DEFAULT_COLOR_GRADE: ColorGrade = {
   brightness: 0,
@@ -296,11 +272,9 @@ export function colorGradeToCSSFilter(grade: ColorGrade): string {
   const hueVal = grade.hue + grade.tint * 0.5;
   const blurVal = grade.blur > 0 ? `${grade.blur}px` : '0px';
 
-  // Temperature approximation via sepia + hue rotate / color shifts
   let filter = `brightness(${brightnessVal.toFixed(3)}) contrast(${contrastVal.toFixed(3)}) saturate(${saturateVal.toFixed(3)}) hue-rotate(${hueVal.toFixed(1)}deg)`;
 
   if (grade.temperature > 0) {
-    // Warm: slight sepia
     filter += ` sepia(${(grade.temperature * 0.25).toFixed(2)}%)`;
   }
 
@@ -319,7 +293,7 @@ export function applyCanvasVignetteAndGrain(
   width: number,
   height: number,
   grade: ColorGrade
-) {
+): void {
   // Vignette
   if (grade.vignette > 0) {
     const radius = Math.sqrt(Math.pow(width / 2, 2) + Math.pow(height / 2, 2));
@@ -340,13 +314,12 @@ export function applyCanvasVignetteAndGrain(
   // Film Grain
   if (grade.grain > 0) {
     const grainAlpha = Math.min(0.25, (grade.grain / 100) * 0.2);
-    // Draw subtle noise pattern
     const step = 4;
     ctx.fillStyle = `rgba(255,255,255,${grainAlpha})`;
     for (let x = 0; x < width; x += step * 3) {
       for (let y = 0; y < height; y += step * 3) {
         if (Math.random() > 0.5) {
-          ctx.fillRect(x + (Math.random() * 2), y + (Math.random() * 2), 2, 2);
+          ctx.fillRect(x + Math.random() * 2, y + Math.random() * 2, 2, 2);
         }
       }
     }

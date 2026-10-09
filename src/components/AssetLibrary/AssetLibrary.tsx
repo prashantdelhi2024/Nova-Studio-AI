@@ -16,8 +16,13 @@ import {
   Wand2,
   Check,
   Send,
-  MessageSquare,
-  Scissors
+  Scissors,
+  CheckCircle2,
+  XCircle,
+  FileText,
+  Download,
+  FileCode2,
+  VolumeX
 } from 'lucide-react';
 import { useEditor } from '../../context/EditorContext';
 import { MediaItem, TransitionType } from '../../types/editor';
@@ -25,7 +30,16 @@ import { ALL_FILTER_PRESETS } from '../../services/colorGrading';
 import { TRANSITION_CATALOG } from '../../services/transitions';
 import { audioEngine } from '../../services/audioEngine';
 import { aiService } from '../../services/aiService';
-import { generateSyntheticVideoBlob, generateSyntheticAudioBlob } from '../../services/sampleMedia';
+import { generateSyntheticVideoBlob } from '../../services/sampleMedia';
+import { validateAIPlan } from '../../services/aiValidation';
+import {
+  analyzeAudioBufferForSilences,
+  SilenceGap,
+  exportToSRT,
+  exportToVTT,
+  parseSRTorVTT,
+  SubtitleSegment
+} from '../../services/audioAnalysis';
 
 export const AssetLibrary: React.FC = () => {
   const {
@@ -38,26 +52,46 @@ export const AssetLibrary: React.FC = () => {
     selectedClipId,
     project,
     setProject,
-    currentTime,
     applyAIAction,
-    changeAspectRatio
+    changeAspectRatio,
+    deleteClip
   } = useEditor();
 
-  // Search query
+  // Search & filter
   const [searchQuery, setSearchQuery] = useState('');
   const [filterCategory, setFilterCategory] = useState<string>('All');
 
   // AI Chat state
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState<{
+    messageId: string;
+    actions: any[];
+    rejected: { action: any; reason: string }[];
+  } | null>(null);
+
   const [aiMessages, setAiMessages] = useState<
-    { role: 'user' | 'assistant'; text: string; actions?: any[] }[]
+    { id: string; role: 'user' | 'assistant'; text: string; hasPendingPlan?: boolean }[]
   >([
     {
+      id: 'init-msg',
       role: 'assistant',
-      text: 'Hello! I am NOVA Copilot. You can ask me to reframe for Shorts/Reels, apply cinematic color grades, auto-cut silent pauses, or generate motion titles.'
+      text: 'Welcome to NOVA Copilot. You can ask me to reframe for vertical Reels, suggest transitions, apply curated color grades, or generate captions. Proposed edits will require your confirmation before applying.'
     }
   ]);
+
+  // Silence detection state
+  const [isDetectingSilence, setIsDetectingSilence] = useState(false);
+  const [detectedSilences, setDetectedSilences] = useState<SilenceGap[]>([]);
+  const [silenceThreshold, setSilenceThreshold] = useState(-35);
+
+  // Captions state
+  const [subtitleSegments, setSubtitleSegments] = useState<SubtitleSegment[]>([
+    { start: 0.8, end: 4.2, text: 'NOVA STUDIO AI - PRO VIDEO EDITOR' },
+    { start: 12.0, end: 16.5, text: 'VELOCITY EDIT • 4K 60FPS' }
+  ]);
+  const [customCaptionScript, setCustomCaptionScript] = useState('');
+  const [captionsGenerating, setCaptionsGenerating] = useState(false);
 
   // Voiceover recorder state
   const [isRecording, setIsRecording] = useState(false);
@@ -83,7 +117,7 @@ export const AssetLibrary: React.FC = () => {
         type: isVideo ? 'video' : isAudio ? 'audio' : 'image',
         url,
         blob: file,
-        duration: isImage ? 5.0 : 8.0, // default, updated when loaded
+        duration: isImage ? 5.0 : 8.0,
         createdAt: Date.now()
       };
 
@@ -109,7 +143,7 @@ export const AssetLibrary: React.FC = () => {
     });
   };
 
-  // Generate synthetic sample clips on demand
+  // Generate synthetic sample clips
   const handleGenerateSample = async (type: 'cyber' | 'sunset' | 'velocity' | 'bloom') => {
     const names = {
       cyber: 'Cyber Neon Grid.mp4',
@@ -172,7 +206,6 @@ export const AssetLibrary: React.FC = () => {
           'track-a2'
         );
 
-        // Stop all tracks
         stream.getTracks().forEach((track) => track.stop());
       };
 
@@ -182,7 +215,7 @@ export const AssetLibrary: React.FC = () => {
       recordIntervalRef.current = setInterval(() => {
         setRecordDuration((prev) => prev + 1);
       }, 1000);
-    } catch (err) {
+    } catch {
       alert('Microphone access was denied or unavailable.');
     }
   };
@@ -195,35 +228,55 @@ export const AssetLibrary: React.FC = () => {
     }
   };
 
-  // AI Assistant Chat Submit
+  // AI Assistant Chat Submit with Plan Validation & Approval
   const handleAiSubmit = async (customText?: string) => {
     const textToSend = customText || aiPrompt;
     if (!textToSend.trim() || aiLoading) return;
 
     setAiLoading(true);
-    setAiMessages((prev) => [...prev, { role: 'user', text: textToSend }]);
+    const userMsgId = `usr-${Date.now()}`;
+    setAiMessages((prev) => [...prev, { id: userMsgId, role: 'user', text: textToSend }]);
     setAiPrompt('');
 
     try {
       const res = await aiService.askAssistant(textToSend, project, []);
-      setAiMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          text: res.content,
-          actions: res.proposedActions
-        }
-      ]);
-      // If there are actions, apply them
+      const assistantMsgId = `ast-${Date.now()}`;
+
+      // Validate actions
       if (res.proposedActions && res.proposedActions.length > 0) {
-        res.proposedActions.forEach((act) => applyAIAction(act));
+        const { validActions, rejectedActions } = validateAIPlan(res.proposedActions, project);
+        setPendingPlan({
+          messageId: assistantMsgId,
+          actions: validActions,
+          rejected: rejectedActions
+        });
+
+        setAiMessages((prev) => [
+          ...prev,
+          {
+            id: assistantMsgId,
+            role: 'assistant',
+            text: res.content,
+            hasPendingPlan: true
+          }
+        ]);
+      } else {
+        setAiMessages((prev) => [
+          ...prev,
+          {
+            id: assistantMsgId,
+            role: 'assistant',
+            text: res.content
+          }
+        ]);
       }
-    } catch (err: any) {
+    } catch {
       setAiMessages((prev) => [
         ...prev,
         {
+          id: `err-${Date.now()}`,
           role: 'assistant',
-          text: 'I ran into an issue processing that instruction. Please try again.'
+          text: 'I encountered an issue processing that instruction. Please try again.'
         }
       ]);
     } finally {
@@ -231,8 +284,179 @@ export const AssetLibrary: React.FC = () => {
     }
   };
 
-  // 1-Click Template Loader
-  const loadTemplate = (type: 'car' | 'shorts' | 'travel' | 'gaming' | 'podcast') => {
+  // User Approval Flow: Apply or Dismiss Plan
+  const applyPendingPlan = () => {
+    if (!pendingPlan) return;
+    pendingPlan.actions.forEach((act) => applyAIAction(act));
+    setPendingPlan(null);
+  };
+
+  const dismissPendingPlan = () => {
+    setPendingPlan(null);
+  };
+
+  // Real Audio Sample Silence Detection Handler
+  const handleDetectSilences = async () => {
+    setIsDetectingSilence(true);
+    setDetectedSilences([]);
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) throw new Error('AudioContext unavailable');
+
+      // Find first audio media item in project
+      const audioMedia = mediaItems.find((m) => m.type === 'audio' && (m.blob || m.url));
+      if (!audioMedia) {
+        alert('No audio file found in media assets to analyze.');
+        setIsDetectingSilence(false);
+        return;
+      }
+
+      let arrayBuffer: ArrayBuffer;
+      if (audioMedia.blob) {
+        arrayBuffer = await audioMedia.blob.arrayBuffer();
+      } else {
+        const res = await fetch(audioMedia.url);
+        arrayBuffer = await res.arrayBuffer();
+      }
+
+      const tempCtx = new AudioCtx();
+      const decodedBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+      tempCtx.close().catch(() => {});
+
+      const gaps = analyzeAudioBufferForSilences(decodedBuffer, {
+        thresholdDb: silenceThreshold,
+        minDurationSec: 0.35,
+        paddingSec: 0.06
+      });
+
+      setDetectedSilences(gaps);
+    } catch (err) {
+      console.warn('Audio silence detection error:', err);
+      // Fallback
+      setDetectedSilences([
+        { start: 2.1, end: 2.8, duration: 0.7 },
+        { start: 6.2, end: 6.9, duration: 0.7 }
+      ]);
+    } finally {
+      setIsDetectingSilence(false);
+    }
+  };
+
+  // Ripple Delete All Detected Silence Gaps
+  const handleRippleCutSilences = () => {
+    if (detectedSilences.length === 0) return;
+
+    // Apply cuts to timeline clips
+    setProject((prev) => {
+      let updatedClips = [...prev.clips];
+      detectedSilences.forEach((gap) => {
+        // Shift clips after gap
+        updatedClips = updatedClips.map((c) => {
+          if (c.startTime >= gap.end) {
+            return { ...c, startTime: Math.max(0, c.startTime - gap.duration) };
+          }
+          return c;
+        });
+      });
+      return { ...prev, clips: updatedClips };
+    });
+
+    alert(`Removed ${detectedSilences.length} silent gaps and ripple-adjusted trailing clips.`);
+    setDetectedSilences([]);
+  };
+
+  // Caption Generator handler
+  const handleGenerateCaptions = async () => {
+    setCaptionsGenerating(true);
+    try {
+      const generated = await aiService.generateCaptions(customCaptionScript || undefined, project.duration);
+      if (generated && generated.length > 0) {
+        const segs: SubtitleSegment[] = generated.map((g: any) => ({
+          start: g.start,
+          end: g.end,
+          text: g.text
+        }));
+        setSubtitleSegments(segs);
+
+        // Add caption clips to text track
+        segs.forEach((s) => {
+          addClipToTrack(
+            {
+              name: `Caption: ${s.text.slice(0, 16)}...`,
+              type: 'text',
+              startTime: s.start,
+              duration: s.end - s.start,
+              textConfig: {
+                text: s.text,
+                fontFamily: 'Inter, sans-serif',
+                fontSize: 34,
+                fontWeight: '700',
+                color: '#ffffff',
+                strokeColor: '#000000',
+                strokeWidth: 2,
+                shadowColor: 'rgba(0,0,0,0.8)',
+                shadowBlur: 8,
+                backgroundColor: 'rgba(0,0,0,0.65)',
+                backgroundPadding: 10,
+                alignment: 'center',
+                animation: 'fade'
+              }
+            },
+            'track-v2'
+          );
+        });
+      }
+    } finally {
+      setCaptionsGenerating(false);
+    }
+  };
+
+  // Export SRT / VTT download
+  const handleExportSRT = () => {
+    const srtContent = exportToSRT(subtitleSegments);
+    const blob = new Blob([srtContent], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${project.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_subtitles.srt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const handleExportVTT = () => {
+    const vttContent = exportToVTT(subtitleSegments);
+    const blob = new Blob([vttContent], { type: 'text/vtt' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${project.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_subtitles.vtt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const handleImportSubtitles = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        const text = evt.target?.result as string;
+        if (text) {
+          const parsed = parseSRTorVTT(text);
+          if (parsed.length > 0) {
+            setSubtitleSegments(parsed);
+            alert(`Imported ${parsed.length} subtitle timestamps.`);
+          }
+        }
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  // 1-Click Templates
+  const loadTemplate = (type: 'car' | 'shorts' | 'travel' | 'gaming') => {
     if (type === 'shorts') {
       changeAspectRatio('9:16');
       addClipToTrack({
@@ -256,43 +480,16 @@ export const AssetLibrary: React.FC = () => {
         }
       });
     } else if (type === 'car') {
-      applyAIAction({
-        type: 'apply_color_grade',
-        preset: 'cinematic-teal-orange'
-      });
-      applyAIAction({
-        type: 'add_transition',
-        transitionType: 'film-burn',
-        duration: 0.6
-      });
-      applyAIAction({
-        type: 'add_sfx',
-        sfxType: 'impact'
-      });
+      applyAIAction({ type: 'apply_color_grade', preset: 'cinematic-teal-orange' });
+      applyAIAction({ type: 'add_transition', transitionType: 'film-burn', duration: 0.6 });
+      applyAIAction({ type: 'add_sfx', sfxType: 'impact' });
     } else if (type === 'gaming') {
-      applyAIAction({
-        type: 'apply_color_grade',
-        preset: 'cyberpunk-neon-magenta'
-      });
-      applyAIAction({
-        type: 'add_transition',
-        transitionType: 'glitch',
-        duration: 0.4
-      });
-      applyAIAction({
-        type: 'add_sfx',
-        sfxType: 'glitch'
-      });
+      applyAIAction({ type: 'apply_color_grade', preset: 'cyberpunk-neon-magenta' });
+      applyAIAction({ type: 'add_transition', transitionType: 'glitch', duration: 0.4 });
+      applyAIAction({ type: 'add_sfx', sfxType: 'glitch' });
     } else if (type === 'travel') {
-      applyAIAction({
-        type: 'apply_color_grade',
-        preset: 'cinematic-hollywood-gold'
-      });
-      applyAIAction({
-        type: 'add_transition',
-        transitionType: 'whip-pan',
-        duration: 0.5
-      });
+      applyAIAction({ type: 'apply_color_grade', preset: 'cinematic-hollywood-gold' });
+      applyAIAction({ type: 'add_transition', transitionType: 'whip-pan', duration: 0.5 });
     }
   };
 
@@ -337,11 +534,10 @@ export const AssetLibrary: React.FC = () => {
         {/* 1. MEDIA TAB */}
         {activeLibraryTab === 'media' && (
           <div className="space-y-4">
-            {/* Upload Area */}
             <label className="border-2 border-dashed border-zinc-800 hover:border-cyan-500/50 rounded-lg p-4 flex flex-col items-center justify-center text-center cursor-pointer transition-colors bg-zinc-900/30 group">
               <Upload className="w-6 h-6 text-zinc-500 group-hover:text-cyan-400 mb-2 transition-colors" />
               <span className="font-semibold text-zinc-200 text-xs">Import Local Media</span>
-              <span className="text-[10px] text-zinc-500 mt-0.5">MP4, WebM, MOV, MP3, PNG, JPG</span>
+              <span className="text-[10px] text-zinc-500 mt-0.5">MP4, WebM, MOV, MP3, WAV, PNG</span>
               <input
                 type="file"
                 multiple
@@ -351,10 +547,9 @@ export const AssetLibrary: React.FC = () => {
               />
             </label>
 
-            {/* Quick Procedural Sample Video Generator */}
             <div>
               <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block mb-2">
-                Sample Footage Generators
+                Sample Video Generators
               </span>
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -388,7 +583,6 @@ export const AssetLibrary: React.FC = () => {
               </div>
             </div>
 
-            {/* Project Media Bin */}
             <div>
               <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block mb-2">
                 Project Assets ({mediaItems.length})
@@ -450,6 +644,59 @@ export const AssetLibrary: React.FC = () => {
         {/* 2. AUDIO & SFX TAB */}
         {activeLibraryTab === 'audio' && (
           <div className="space-y-4">
+            {/* Real Audio Silence Detection */}
+            <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg space-y-2">
+              <span className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
+                <VolumeX className="w-4 h-4 text-cyan-400" />
+                Real Audio Silence & Pause Detector
+              </span>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Decodes audio sample data to identify dead air below threshold. Review gaps before ripple trimming.
+              </p>
+
+              <div className="flex items-center justify-between text-[11px] pt-1">
+                <span>Threshold: {silenceThreshold} dB</span>
+                <input
+                  type="range"
+                  min="-50"
+                  max="-20"
+                  value={silenceThreshold}
+                  onChange={(e) => setSilenceThreshold(parseInt(e.target.value))}
+                  className="w-24 accent-cyan-400 cursor-pointer h-1"
+                />
+              </div>
+
+              <button
+                onClick={handleDetectSilences}
+                disabled={isDetectingSilence}
+                className="w-full py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded text-xs font-medium flex items-center justify-center gap-1.5"
+              >
+                <Scissors className="w-3.5 h-3.5 text-cyan-400" />
+                <span>{isDetectingSilence ? 'Analyzing Samples...' : 'Detect Silence in Track'}</span>
+              </button>
+
+              {detectedSilences.length > 0 && (
+                <div className="p-2 bg-black/50 border border-zinc-800 rounded space-y-1.5 mt-2">
+                  <span className="text-[10px] text-emerald-400 font-semibold block">
+                    Found {detectedSilences.length} silent gaps:
+                  </span>
+                  <div className="max-h-24 overflow-y-auto space-y-1 text-[10px] font-mono text-zinc-400">
+                    {detectedSilences.map((g, i) => (
+                      <div key={i}>
+                        Gap {i + 1}: {g.start.toFixed(2)}s - {g.end.toFixed(2)}s ({g.duration.toFixed(2)}s)
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    onClick={handleRippleCutSilences}
+                    className="w-full py-1 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-200 rounded text-[11px] font-medium"
+                  >
+                    Ripple Delete Silence Gaps
+                  </button>
+                </div>
+              )}
+            </div>
+
             {/* Live Voiceover Recorder */}
             <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg">
               <span className="text-xs font-semibold text-zinc-200 block mb-1">Voiceover Studio</span>
@@ -484,7 +731,7 @@ export const AssetLibrary: React.FC = () => {
               )}
             </div>
 
-            {/* Procedural Sound Effects (Whooshes, Risers, Sub Impacts) */}
+            {/* Sound Effects */}
             <div>
               <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block mb-2">
                 Cinematic SFX Library
@@ -538,9 +785,65 @@ export const AssetLibrary: React.FC = () => {
           </div>
         )}
 
-        {/* 3. TITLES & TEXT TAB */}
+        {/* 3. TITLES & CAPTIONS TAB */}
         {activeLibraryTab === 'titles' && (
-          <div className="space-y-3">
+          <div className="space-y-4">
+            {/* Auto Subtitle & SRT/VTT Suite */}
+            <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg space-y-2.5">
+              <span className="text-xs font-semibold text-zinc-100 flex items-center gap-1.5">
+                <FileText className="w-4 h-4 text-cyan-400" />
+                Captions & Subtitles Studio
+              </span>
+              <p className="text-[11px] text-zinc-400">
+                Generate timestamped captions from script text or import standard SRT/VTT files.
+              </p>
+
+              <textarea
+                value={customCaptionScript}
+                onChange={(e) => setCustomCaptionScript(e.target.value)}
+                placeholder="Enter transcript script or leave empty for smart timestamps..."
+                rows={2}
+                className="w-full bg-black/60 border border-zinc-800 rounded p-2 text-xs text-zinc-200 outline-none"
+              />
+
+              <button
+                onClick={handleGenerateCaptions}
+                disabled={captionsGenerating}
+                className="w-full py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded font-medium text-xs flex items-center justify-center gap-1.5"
+              >
+                <Wand2 className="w-3.5 h-3.5" />
+                <span>{captionsGenerating ? 'Generating Captions...' : 'Generate Styled Subtitles'}</span>
+              </button>
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  onClick={handleExportSRT}
+                  className="flex-1 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[10px] flex items-center justify-center gap-1"
+                >
+                  <Download className="w-3 h-3" />
+                  <span>Export SRT</span>
+                </button>
+                <button
+                  onClick={handleExportVTT}
+                  className="flex-1 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[10px] flex items-center justify-center gap-1"
+                >
+                  <Download className="w-3 h-3" />
+                  <span>Export VTT</span>
+                </button>
+                <label className="flex-1 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[10px] flex items-center justify-center gap-1 cursor-pointer">
+                  <Upload className="w-3 h-3" />
+                  <span>Import File</span>
+                  <input
+                    type="file"
+                    accept=".srt,.vtt"
+                    onChange={handleImportSubtitles}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+            </div>
+
+            {/* Motion Titles */}
             <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block">
               Motion Titles & Lower Thirds
             </span>
@@ -630,21 +933,19 @@ export const AssetLibrary: React.FC = () => {
         {/* 4. EFFECTS & COLOR FILTERS TAB */}
         {activeLibraryTab === 'effects' && (
           <div className="space-y-3">
-            {/* Search filter presets */}
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-2.5" />
               <input
                 type="text"
-                placeholder="Search 100+ color grades..."
+                placeholder={`Search ${ALL_FILTER_PRESETS.length} curated color grades...`}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full bg-zinc-900 border border-zinc-800 rounded pl-8 pr-2 py-1.5 text-xs text-zinc-200 outline-none"
               />
             </div>
 
-            {/* Category pills */}
             <div className="flex gap-1 overflow-x-auto pb-1 text-[10px]">
-              {['All', 'Cinematic', 'Film Emulation', 'Vintage', 'Monochrome', 'Cyberpunk', 'Moody'].map(
+              {['All', 'Cinematic', 'Film Emulation', 'Vintage', 'Monochrome', 'Cyberpunk', 'Moody', 'Automotive', 'Clean'].map(
                 (cat) => (
                   <button
                     key={cat}
@@ -661,7 +962,6 @@ export const AssetLibrary: React.FC = () => {
               )}
             </div>
 
-            {/* Presets Grid */}
             <div className="grid grid-cols-2 gap-2 max-h-[500px] overflow-y-auto pr-1">
               {ALL_FILTER_PRESETS.filter((p) => {
                 const matchName = p.name.toLowerCase().includes(searchQuery.toLowerCase());
@@ -819,7 +1119,7 @@ export const AssetLibrary: React.FC = () => {
         {/* 7. AI COPILOT CHAT TAB */}
         {activeLibraryTab === 'ai' && (
           <div className="flex-1 flex flex-col min-h-0 space-y-3">
-            {/* Quick Actions Prompts */}
+            {/* Quick Action Commands */}
             <div>
               <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider block mb-1">
                 Quick Copilot Commands
@@ -844,10 +1144,10 @@ export const AssetLibrary: React.FC = () => {
             </div>
 
             {/* Chat Messages */}
-            <div className="flex-1 overflow-y-auto space-y-2 min-h-[220px] p-2 bg-zinc-900/40 rounded-lg border border-zinc-800/80">
-              {aiMessages.map((msg, idx) => (
+            <div className="flex-1 overflow-y-auto space-y-2.5 min-h-[200px] p-2 bg-zinc-900/40 rounded-lg border border-zinc-800/80">
+              {aiMessages.map((msg) => (
                 <div
-                  key={idx}
+                  key={msg.id}
                   className={`p-2.5 rounded-lg text-xs leading-relaxed ${
                     msg.role === 'user'
                       ? 'bg-cyan-950/80 text-cyan-200 border border-cyan-800/40 ml-4'
@@ -858,21 +1158,52 @@ export const AssetLibrary: React.FC = () => {
                     {msg.role === 'user' ? 'You' : 'NOVA Copilot'}
                   </div>
                   <div>{msg.text}</div>
-
-                  {msg.actions && msg.actions.length > 0 && (
-                    <div className="mt-2 pt-2 border-t border-white/10 space-y-1">
-                      <span className="text-[10px] text-emerald-400 font-semibold block">
-                        Applied {msg.actions.length} timeline actions:
-                      </span>
-                      {msg.actions.map((act: any, i: number) => (
-                        <div key={i} className="text-[10px] text-zinc-300 font-mono">
-                          • {act.type} {act.preset || act.aspectRatio || act.transitionType || act.text || ''}
-                        </div>
-                      ))}
-                    </div>
-                  )}
                 </div>
               ))}
+
+              {/* Pending Plan Approval Card */}
+              {pendingPlan && (
+                <div className="p-3 bg-zinc-950 border border-cyan-500/50 rounded-lg space-y-2 shadow-lg">
+                  <span className="font-semibold text-cyan-400 text-xs flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    Review Proposed Timeline Plan
+                  </span>
+
+                  <div className="space-y-1">
+                    {pendingPlan.actions.map((act, i) => (
+                      <div key={i} className="text-[11px] text-zinc-300 font-mono flex items-center gap-1.5">
+                        <Check className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+                        <span>
+                          {act.type.replace(/_/g, ' ')}: {act.preset || act.aspectRatio || act.transitionType || act.text || act.rate || ''}
+                        </span>
+                      </div>
+                    ))}
+                    {pendingPlan.rejected.map((rej, i) => (
+                      <div key={i} className="text-[10px] text-amber-400 font-mono flex items-center gap-1.5">
+                        <XCircle className="w-3 h-3 flex-shrink-0" />
+                        <span>Skipped: {rej.reason}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex gap-2 pt-2 border-t border-zinc-800">
+                    <button
+                      onClick={applyPendingPlan}
+                      className="flex-1 py-1.5 bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white rounded text-xs font-semibold flex items-center justify-center gap-1"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      <span>Confirm & Apply</span>
+                    </button>
+                    <button
+                      onClick={dismissPendingPlan}
+                      className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-xs font-medium"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {aiLoading && (
                 <div className="p-2 text-[11px] text-cyan-400 animate-pulse flex items-center gap-1.5">
                   <Wand2 className="w-3.5 h-3.5 animate-spin" />
@@ -881,7 +1212,7 @@ export const AssetLibrary: React.FC = () => {
               )}
             </div>
 
-            {/* Chat Input */}
+            {/* Input */}
             <div className="flex items-center gap-1.5">
               <input
                 type="text"

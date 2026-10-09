@@ -12,8 +12,7 @@ import {
   Gauge
 } from 'lucide-react';
 import { useEditor } from '../context/EditorContext';
-import { colorGradeToCSSFilter, applyCanvasVignetteAndGrain } from '../services/colorGrading';
-import { renderTransitionEffect } from '../services/transitions';
+import { renderTimelineFrame } from '../services/videoCompositor';
 import { audioEngine } from '../services/audioEngine';
 
 export const PreviewMonitor: React.FC = () => {
@@ -90,165 +89,15 @@ export const PreviewMonitor: React.FC = () => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const width = canvas.width;
-    const height = canvas.height;
-
-    // Clear background
-    ctx.fillStyle = '#050508';
-    ctx.fillRect(0, 0, width, height);
-
-    // Sort tracks from bottom to top (highest order to lowest)
-    const sortedTracks = [...project.tracks].sort((a, b) => b.order - a.order);
-
-    for (const track of sortedTracks) {
-      if (track.isHidden) continue;
-
-      const activeClips = project.clips.filter(
-        (c) => c.trackId === track.id &&
-               currentTime >= c.startTime &&
-               currentTime < c.startTime + c.duration
-      );
-
-      for (const clip of activeClips) {
-        const localTime = currentTime - clip.startTime;
-
-        ctx.save();
-        ctx.globalAlpha = clip.transform.opacity;
-
-        // Origin at center
-        ctx.translate(width / 2 + clip.transform.x * width, height / 2 + clip.transform.y * height);
-        ctx.rotate((clip.transform.rotation * Math.PI) / 180);
-        ctx.scale(
-          clip.transform.scale * (clip.transform.flipH ? -1 : 1),
-          clip.transform.scale * (clip.transform.flipV ? -1 : 1)
-        );
-
-        if (clip.type === 'video' || clip.type === 'image') {
-          const vid = clip.mediaId ? videoElementsPool.current.get(clip.mediaId) : null;
-          if (vid && vid.readyState >= 2) {
-            ctx.filter = colorGradeToCSSFilter(clip.colorGrade);
-            ctx.drawImage(vid, -width / 2, -height / 2, width, height);
-            ctx.filter = 'none';
-          } else {
-            // High-fidelity procedural background
-            ctx.fillStyle = clip.color || '#1e293b';
-            ctx.fillRect(-width / 2, -height / 2, width, height);
-
-            // Procedural preview pattern
-            ctx.fillStyle = 'rgba(255,255,255,0.08)';
-            ctx.font = 'bold 36px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(clip.name.toUpperCase(), 0, 0);
-          }
-
-          // Vignette and film grain
-          applyCanvasVignetteAndGrain(ctx, width, height, clip.colorGrade);
-
-        } else if (clip.type === 'text' && clip.textConfig) {
-          const tc = clip.textConfig;
-          ctx.textAlign = tc.alignment as CanvasTextAlign;
-          ctx.textBaseline = 'middle';
-          ctx.font = `${tc.fontWeight} ${tc.fontSize}px ${tc.fontFamily}`;
-
-          let animAlpha = 1;
-          let animOffsetY = 0;
-          if (tc.animation === 'fade') {
-            animAlpha = Math.min(1, localTime * 2.5);
-          } else if (tc.animation === 'slide-up') {
-            const p = Math.min(1, localTime * 2);
-            animOffsetY = (1 - p) * 30;
-            animAlpha = p;
-          } else if (tc.animation === 'pop-in') {
-            const p = Math.min(1, localTime * 3);
-            ctx.scale(0.85 + 0.15 * p, 0.85 + 0.15 * p);
-            animAlpha = p;
-          }
-
-          ctx.globalAlpha *= animAlpha;
-
-          // Background box
-          if (tc.backgroundColor && tc.backgroundColor !== 'transparent') {
-            const textMetrics = ctx.measureText(tc.text);
-            const pad = tc.backgroundPadding;
-            const boxW = textMetrics.width + pad * 2;
-            const boxH = tc.fontSize * 1.35 + pad * 1.5;
-            ctx.fillStyle = tc.backgroundColor;
-            ctx.fillRect(-boxW / 2, -boxH / 2 + animOffsetY, boxW, boxH);
-          }
-
-          // Stroke
-          if (tc.strokeWidth > 0 && tc.strokeColor) {
-            ctx.strokeStyle = tc.strokeColor;
-            ctx.lineWidth = tc.strokeWidth;
-            ctx.strokeText(tc.text, 0, animOffsetY);
-          }
-
-          // Shadow
-          if (tc.shadowBlur > 0) {
-            ctx.shadowColor = tc.shadowColor;
-            ctx.shadowBlur = tc.shadowBlur;
-          }
-
-          // Fill text
-          ctx.fillStyle = tc.color;
-          ctx.fillText(tc.text, 0, animOffsetY);
-          ctx.shadowBlur = 0;
-        }
-
-        ctx.restore();
-
-        // Transitions
-        if (clip.transitionIn && clip.transitionIn.type !== 'none') {
-          const inDur = clip.transitionIn.duration;
-          if (localTime <= inDur) {
-            const progress = localTime / inDur;
-            renderTransitionEffect(ctx, width, height, clip.transitionIn.type, progress);
-          }
-        }
-
-        if (clip.transitionOut && clip.transitionOut.type !== 'none') {
-          const outDur = clip.transitionOut.duration;
-          const timeRemaining = clip.duration - localTime;
-          if (timeRemaining <= outDur) {
-            const progress = 1 - timeRemaining / outDur;
-            renderTransitionEffect(ctx, width, height, clip.transitionOut.type, progress);
-          }
-        }
-      }
-    }
-
-    // Safe Area Guides Overlay
-    if (showSafeAreas) {
-      ctx.save();
-      ctx.lineWidth = 1;
-
-      // Action safe (90%)
-      ctx.strokeStyle = 'rgba(6, 182, 212, 0.6)';
-      ctx.strokeRect(width * 0.05, height * 0.05, width * 0.9, height * 0.9);
-
-      // Title safe (80%)
-      ctx.strokeStyle = 'rgba(234, 179, 8, 0.6)';
-      ctx.strokeRect(width * 0.1, height * 0.1, width * 0.8, height * 0.8);
-
-      // Rule of Thirds
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-      ctx.beginPath();
-      ctx.moveTo(width / 3, 0); ctx.lineTo(width / 3, height);
-      ctx.moveTo((width / 3) * 2, 0); ctx.lineTo((width / 3) * 2, height);
-      ctx.moveTo(0, height / 3); ctx.lineTo(width, height / 3);
-      ctx.moveTo(0, (height / 3) * 2); ctx.lineTo(width, (height / 3) * 2);
-      ctx.stroke();
-
-      // Center crosshair
-      ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
-      ctx.beginPath();
-      ctx.moveTo(width / 2 - 15, height / 2); ctx.lineTo(width / 2 + 15, height / 2);
-      ctx.moveTo(width / 2, height / 2 - 15); ctx.lineTo(width / 2, height / 2 + 15);
-      ctx.stroke();
-
-      ctx.restore();
-    }
+    renderTimelineFrame(
+      ctx,
+      canvas.width,
+      canvas.height,
+      project,
+      currentTime,
+      videoElementsPool.current,
+      { showSafeAreas }
+    );
   }, [project, currentTime, showSafeAreas]);
 
   // Trigger render on time change or state update

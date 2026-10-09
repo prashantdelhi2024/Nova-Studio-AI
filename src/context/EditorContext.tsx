@@ -686,11 +686,12 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       project,
       settings,
       mediaElementsRef.current,
+      mediaItems,
       (progress) => {
         setExportProgress({ ...progress });
       }
     );
-  }, [project]);
+  }, [project, mediaItems]);
 
   const cancelExport = useCallback(() => {
     renderExporter.cancel();
